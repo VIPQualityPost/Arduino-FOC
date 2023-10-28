@@ -116,6 +116,29 @@ int  StepperMotor::initFOC() {
     shaft_angle = sensor->getAngle();
   } else { SIMPLEFOC_DEBUG("MOT: No sensor."); }
 
+
+  /**
+   * Check if current sense and align if necessary - can be skipped.
+   * Checks if driver phases are the same as current sense phases.
+   * Checks direction of measurement.
+   * */ 
+
+  _delay(500);
+  if(exit_flag){
+    if(current_sense){
+      if(!current_sense->initialized){
+        motor_status = FOCMotorStatus::motor_calib_failed;
+        SIMPLEFOC_DEBUG("MOT: INit FOC error, current sense not initalized.");
+        exit_flag = 0;
+      }else{
+        exit_flag *= alignCurrentSense();
+      }
+      }
+      else{
+        SIMPLEFOC_DEBUG("MOT: No current sense.")
+      }
+    }
+
   if(exit_flag){
     SIMPLEFOC_DEBUG("MOT: Ready.");
     motor_status = FOCMotorStatus::motor_ready;
@@ -126,6 +149,26 @@ int  StepperMotor::initFOC() {
   }
 
   return exit_flag;
+}
+
+// Calibrate the motor and current sense phases
+int StepperMotor::alignCurrentSense() {
+  int exit_flag = 1; // success
+
+  SIMPLEFOC_DEBUG("MOT: Align current sense.");
+
+  // align current sense and the driver
+  exit_flag = current_sense->driverAlign(voltage_sensor_align);
+  if(!exit_flag){
+    // error in current sense - phase either not measured or bad connection
+    SIMPLEFOC_DEBUG("MOT: Align error!");
+    exit_flag = 0;
+  }else{
+    // output the alignment status flag
+    SIMPLEFOC_DEBUG("MOT: Success: ", exit_flag);
+  }
+
+  return exit_flag > 0;
 }
 
 // Encoder alignment to electrical 0 angle
@@ -258,6 +301,44 @@ void StepperMotor::loopFOC() {
   // This function will not have numerical issues because it uses Sensor::getMechanicalAngle() 
   // which is in range 0-2PI
   electrical_angle = electricalAngle();
+
+  switch (torque_controller)
+  {
+  case TorqueControlType::voltage:
+    /* Don't really need to do anything. */
+    break;
+  
+  case TorqueControlType::dc_current:
+    if(!current_sense) return;
+    // read total current
+    current.q = current_sense->getDCCurrent(electrical_angle);
+    // filter the values
+    current.q = LPF_current_q(current.q);
+    // find phase voltage
+    voltage.q = PID_current_q(current_sp - current.q);
+    // d voltage -> lag compensation
+    if(_isset(phase_inductance)) voltage.d = _constrain(-current_sp * shaft_velocity * pole_pairs * phase_inductance, -voltage_limit, voltage_limit);
+    else voltage.d = 0;
+    break;
+
+  case TorqueControlType::foc_current:
+    if(!current_sense) return;
+    // read total current
+    current = current_sense->getFOCCurrents(electrical_angle);
+    // filter component currents
+    current.q = LPF_current_q(current.q);
+    current.d = LPF_current_d(current.d);
+    // find phase voltages for each axis
+    voltage.q = PID_current_q(current_sp - current.q);
+    voltage.d = PID_current_d(-current.d);
+
+    // TODO: add in lag compensation 
+    break;
+
+  default:
+    SIMPLEFOC_DEBUG("MOT: no torque control selected!");
+    break;
+  }
 
   // set the phase voltage - FOC heart function :)
   setPhaseVoltage(voltage.q, voltage.d, electrical_angle);
